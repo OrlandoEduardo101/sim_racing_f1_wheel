@@ -2,6 +2,7 @@
 #include "CommManager.h"
 #include <Arduino_GFX_Library.h>
 #include "LedManager.h"
+#include "WheelController.h"
 
 // Variáveis para dados do SimHub
 int currentRPM = 0;
@@ -83,6 +84,11 @@ Arduino_GFX *gfx = new Arduino_ST7796(
 CommManager commManager(gfx);
 
 LedManager ledManager;
+WheelController wheelController;
+
+// Variável para controle de tempo
+unsigned long lastWheelUpdate = 0;
+const unsigned long WHEEL_UPDATE_INTERVAL = 10; // 10ms = 100Hz
 
 void setup(void)
 {
@@ -108,6 +114,15 @@ void setup(void)
 
   ledManager.begin();
   ledManager.setMaxRPM(9000);  // Ajuste para o RPM máximo do seu carro
+
+  // Inicializa o controlador do volante
+  wheelController.begin();
+  
+  // Mensagem inicial no display
+  gfx->setCursor(0, 0);
+  gfx->setTextColor(WHITE);
+  gfx->println("F1 Wheel + SimHub Display");
+  gfx->println("Iniciando...");
 }
 
 void loop()
@@ -152,6 +167,16 @@ void loop()
   ledManager.update();
 
   commManager.loop();
+
+  // Atualização do volante em intervalo fixo
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastWheelUpdate >= WHEEL_UPDATE_INTERVAL) {
+    lastWheelUpdate = currentMillis;
+    wheelController.loop();
+    
+    // Usar LedManager para controlar todos os LEDs
+    ledManager.handleWheelEvents(drsEnabled, yellowFlag, blueFlag);
+  }
 }
 
 void idle(bool critical) {

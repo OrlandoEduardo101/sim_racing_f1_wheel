@@ -1,6 +1,53 @@
 #pragma once
+#include <Arduino.h>
 #include <FastLED.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
 #include "Config.h"
+
+/*
+ * GUIA DE INSTALAÇÃO DOS LEDS COM PCA9685 E IRLZ34N
+ * ------------------------------------------------
+ * 
+ * 1. Conexões do PCA9685:
+ *    - VCC  -> 3.3V
+ *    - GND  -> GND
+ *    - SDA  -> GPIO 22 (I2C)
+ *    - SCL  -> GPIO 23 (I2C)
+ *    - OE   -> GND (sempre habilitado)
+ * 
+ * 2. Para cada LED de botão:
+ *    Canal PCA9685 -> IRLZ34N -> LED
+ *    Exemplo para um LED:
+ *    - Canal PWM do PCA9685 -> Resistor 220Ω -> Gate do IRLZ34N
+ *    - Drain do IRLZ34N -> Cátodo do LED
+ *    - Ânodo do LED -> 3.3V
+ *    - Source do IRLZ34N -> GND
+ *    - Resistor 10k entre Gate e GND (pull-down)
+ * 
+ * 3. Para os WS2812B (LEDs endereçáveis):
+ *    - VDD  -> 5V
+ *    - GND  -> GND
+ *    - DIN  -> GPIO 21 (através do conversor de nível)
+ *    - DOUT -> DIN do próximo LED
+ * 
+ * NOTAS IMPORTANTES:
+ * ----------------
+ * 1. Alimentação:
+ *    - Use fonte 5V/2A para os WS2812B
+ *    - PCA9685 e LEDs simples podem usar 3.3V do ESP32
+ * 
+ * 2. Proteção:
+ *    - Capacitor 100µF entre VCC e GND do PCA9685
+ *    - Capacitor 1000µF na alimentação dos WS2812B
+ *    - Resistores pull-down de 10k em cada Gate
+ * 
+ * 3. Considerações:
+ *    - O PCA9685 tem resolução de 12 bits (4096 níveis)
+ *    - Frequência PWM de 1000Hz é boa para evitar flicker
+ *    - IRLZ34N suporta controle com 3.3V no Gate
+ *    - Mantenha os fios de dados curtos e organizados
+ */
 
 /*
  * GUIA DE INSTALAÇÃO DOS WS2812B COM TXS0108E E CONTROLE DE BRILHO
@@ -55,29 +102,65 @@
  *    - Faça conexões sólidas
  */
 
+// Definições para LEDs
+#define NUM_LEDS 16          // LEDs endereçáveis para RPM
+#define LED_PIN 21           // Pino para dados dos LEDs endereçáveis
+#define NUM_BUTTON_LEDS 10   // LEDs simples dos botões
+#define MAX_BRIGHTNESS 255   // Brilho máximo
+
+// Endereço I2C do PCA9685
+#define PCA9685_I2C_ADDRESS 0x40
+
 class LedManager {
 private:
     CRGB leds[NUM_LEDS];
-    int maxRPM = 0;
-    int rpmValue = 0;
-    int currentBrightness = 10;  // Começa com 50% do brilho
+    Adafruit_PWM_Servo_Driver pwm;
     
-    // Variáveis para controle do pisca
-    bool isBlinking = false;
-    CRGB blinkColor = CRGB::Black;
-    unsigned long lastBlinkTime = 0;
-    const unsigned long BLINK_INTERVAL = 500; // Intervalo de 500ms (meio segundo)
+    int maxRPM;
+    int currentRPM;
+    bool drsZone;
+    bool drsEnabled;
+    bool yellowFlagActive;
+    bool blueFlagActive;
+    
+    uint8_t buttonLedBrightness[NUM_BUTTON_LEDS];
+
+    // Cores predefinidas
+    const CRGB COLOR_RPM_LOW = CRGB::Green;
+    const CRGB COLOR_RPM_MID = CRGB::Yellow;
+    const CRGB COLOR_RPM_HIGH = CRGB::Red;
+    const CRGB COLOR_DRS = CRGB::Purple;
+    const CRGB COLOR_YELLOW_FLAG = CRGB::Yellow;
+    const CRGB COLOR_BLUE_FLAG = CRGB::Blue;
 
 public:
-    void begin() {
-        FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-        setBrightness(10);  // Inicia com 50% do brilho
-        clearAll();
+    LedManager() : 
+        pwm(PCA9685_I2C_ADDRESS),
+        maxRPM(0),
+        currentRPM(0),
+        drsZone(false),
+        drsEnabled(false),
+        yellowFlagActive(false),
+        blueFlagActive(false) {
+            memset(buttonLedBrightness, 0, sizeof(buttonLedBrightness));
     }
 
-    void clearAll() {
-        FastLED.clear();
-        FastLED.show();
+    void begin() {
+        // Inicializa LEDs endereçáveis
+        FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+        FastLED.setBrightness(MAX_BRIGHTNESS);
+        
+        // Inicializa PCA9685
+        pwm.begin();
+        pwm.setPWMFreq(1000);  // Frequência PWM de 1KHz
+        
+        // Configura todos os canais do PCA9685 para 0
+        for (int i = 0; i < 16; i++) {
+            pwm.setPWM(i, 0, 0);
+        }
+        
+        // Limpa todos os LEDs
+        clearAll();
     }
 
     void setMaxRPM(int rpm) {
@@ -85,126 +168,122 @@ public:
     }
 
     void updateRPM(int rpm) {
-        rpmValue = rpm;
-        int ledsToLight = map(rpm, 0, maxRPM, 0, RPM_LEDS);
+        currentRPM = rpm;
+        updateRPMLeds();
+    }
+
+    void setButtonLED(uint8_t index, uint8_t brightness) {
+        if (index < NUM_BUTTON_LEDS) {
+            buttonLedBrightness[index] = brightness;
+            // Mapeia o brilho de 0-255 para 0-4095 (resolução do PCA9685)
+            uint16_t pwmValue = map(brightness, 0, 255, 0, 4095);
+            pwm.setPWM(index, 0, pwmValue);
+        }
+    }
+
+    void setDRSZone(bool active) {
+        drsZone = active;
+        updateDRSLeds();
+    }
+
+    void setDRSEnabled(bool enabled) {
+        drsEnabled = enabled;
+        updateDRSLeds();
+    }
+
+    void setYellowFlag() {
+        yellowFlagActive = true;
+        updateFlagLeds();
+    }
+
+    void setBlueFlag() {
+        blueFlagActive = true;
+        updateFlagLeds();
+    }
+
+    void clearFlags() {
+        yellowFlagActive = false;
+        blueFlagActive = false;
+        updateFlagLeds();
+    }
+
+    void update() {
+        updateRPMLeds();
+        updateDRSLeds();
+        updateFlagLeds();
+        FastLED.show();
+    }
+
+    void handleWheelEvents(bool drsActive, bool yellowFlag, bool blueFlag) {
+        // LED 0 para DRS
+        setButtonLED(0, drsActive ? MAX_BRIGHTNESS : 0);
         
-        // Cores para a barra de RPM
-        for(int i = RPM_START_LED; i <= RPM_END_LED; i++) {
-            int rpmIndex = i - RPM_START_LED;
-            if(rpmIndex < ledsToLight) {
-                if(rpmIndex < RPM_LEDS * 0.7)      // Verde até 70%
-                    leds[i] = CRGB::Green;
-                else if(rpmIndex < RPM_LEDS * 0.9)  // Amarelo até 90%
-                    leds[i] = CRGB::Yellow;
-                else                                // Vermelho após 90%
-                    leds[i] = CRGB::Red;
+        // LED 1 para bandeira amarela
+        setButtonLED(1, yellowFlag ? MAX_BRIGHTNESS : 0);
+        
+        // LED 2 para bandeira azul
+        setButtonLED(2, blueFlag ? MAX_BRIGHTNESS : 0);
+    }
+
+private:
+    void updateRPMLeds() {
+        int numLedsToLight = map(currentRPM, 0, maxRPM, 0, NUM_LEDS);
+        
+        for (int i = 0; i < NUM_LEDS; i++) {
+            if (i < numLedsToLight) {
+                // Define cor baseada na porcentagem do RPM
+                float rpmPercent = (float)i / NUM_LEDS;
+                if (rpmPercent < 0.5) {
+                    leds[i] = COLOR_RPM_LOW;
+                } else if (rpmPercent < 0.8) {
+                    leds[i] = COLOR_RPM_MID;
+                } else {
+                    leds[i] = COLOR_RPM_HIGH;
+                }
             } else {
                 leds[i] = CRGB::Black;
             }
         }
-        FastLED.show();
     }
 
-    void update() {
-        // Atualiza o estado do pisca-pisca se estiver ativo
-        if (isBlinking) {
-            unsigned long currentTime = millis();
-            if (currentTime - lastBlinkTime >= BLINK_INTERVAL) {
-                static bool blinkState = false;
-                blinkState = !blinkState;
-                
-                CRGB colorToShow = blinkState ? blinkColor : CRGB::Black;
-                setAlert(colorToShow);
-                
-                lastBlinkTime = currentTime;
+    void updateDRSLeds() {
+        // Usa os últimos 2 LEDs para indicação de DRS
+        if (drsZone) {
+            if (drsEnabled) {
+                leds[NUM_LEDS-1] = COLOR_DRS;
+                leds[NUM_LEDS-2] = COLOR_DRS;
+            } else {
+                leds[NUM_LEDS-1] = COLOR_DRS;
+                leds[NUM_LEDS-2] = CRGB::Black;
             }
-        }
-    }
-
-    void startBlink(CRGB color) {
-        isBlinking = true;
-        blinkColor = color;
-        lastBlinkTime = millis();
-    }
-
-    void stopBlink() {
-        isBlinking = false;
-        setAlert(CRGB::Black);
-    }
-
-    // Novo método para atualizar todos os LEDs de alerta
-    void setAlert(CRGB color) {
-        // Atualiza primeiro grupo de alerta (LEDs 0-3)
-        for(int i = ALERT_START_1; i <= ALERT_END_1; i++) {
-            leds[i] = color;
-        }
-        
-        // Atualiza segundo grupo de alerta (LEDs 20-23)
-        for(int i = ALERT_START_2; i <= ALERT_END_2; i++) {
-            leds[i] = color;
-        }
-        FastLED.show();
-    }
-
-    // Métodos para diferentes tipos de alerta
-    void setYellowFlag() { startBlink(CRGB::Yellow); }
-    void setBlueFlag() { startBlink(CRGB::Blue); }
-    void setRedFlag() { startBlink(CRGB::Red); }
-    void setGreenFlag() { startBlink(CRGB::Green); }
-    void setWhiteFlag() { startBlink(CRGB::White); }
-    void setPurpleFlag() { startBlink(CRGB::Purple); }
-    void setDRSZone(bool active) { 
-        if(active) {
-            isBlinking = false;
-            setAlert(CRGB::Purple);
         } else {
-            clearAlert();
+            leds[NUM_LEDS-1] = CRGB::Black;
+            leds[NUM_LEDS-2] = CRGB::Black;
         }
     }
-    void setDRSEnabled(bool active) { 
-        if(active) {
-            isBlinking = false;
-            setAlert(CRGB::Blue);
+
+    void updateFlagLeds() {
+        // Usa os primeiros LEDs para flags
+        if (yellowFlagActive) {
+            leds[0] = COLOR_YELLOW_FLAG;
+            leds[1] = COLOR_YELLOW_FLAG;
+        } else if (blueFlagActive) {
+            leds[0] = COLOR_BLUE_FLAG;
+            leds[1] = COLOR_BLUE_FLAG;
         } else {
-            clearAlert();
+            // Retorna ao padrão de RPM se não houver flags
+            updateRPMLeds();
         }
-    }
-    void clearAlert() {
-        isBlinking = false;
-        setAlert(CRGB::Black);
     }
 
-    // Novo método para controle de brilho
-    void setBrightness(int level) {
-        // Limita o nível entre 0 e 20
-        level = constrain(level, MIN_BRIGHTNESS, MAX_BRIGHTNESS);
-        currentBrightness = level;
-        
-        // limitador para evitar do led trabalhar no seu maximo e economizar vida util
-        if(currentBrightness >= 18){
-            currentBrightness = 18;
-            level = 18;
-        }
-        
-        // Converte a escala 0-20 para 0-255 que o FastLED usa
-        int fastLedBrightness = map(level, 0, 20, 0, 255);
-        // Ajustado para que 20 seja realmente 100% (255)
-        //uint8_t fastLedBrightness = (level * 255) / 20;
-        FastLED.setBrightness(fastLedBrightness);
+    void clearAll() {
+        // Limpa LEDs endereçáveis
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
         FastLED.show();
-    }
-
-    // Método para obter o brilho atual
-    int getBrightness() {
-        return currentBrightness;
-    }
-
-    // Métodos para ajuste incremental do brilho
-    void increaseBrightness() {
-        setBrightness(currentBrightness + 1);
-    }
-
-    void decreaseBrightness() {
-        setBrightness(currentBrightness - 1);
+        
+        // Limpa LEDs dos botões
+        for (int i = 0; i < NUM_BUTTON_LEDS; i++) {
+            setButtonLED(i, 0);
+        }
     }
 }; 
